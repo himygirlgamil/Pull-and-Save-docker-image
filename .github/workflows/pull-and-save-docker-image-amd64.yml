@@ -1,34 +1,71 @@
+name: x86-64 Pull and Save Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_images:
+        description: '请填写 docker 镜像名称 多个用英文逗号分开'
+        required: true
+        default: 'alpine:latest,busybox:stable-glibc'
+      artifact_name:
+        description: '请填写制品包名称'
+        required: true
+        default: 'artifact'
+
+jobs:
+  pull_and_package:
+    runs-on: ubuntu-22.04
+    outputs:
+      public_artifacts: true
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Clean up Docker to free space
+      run: |
+          docker system prune -a -f
+          docker volume prune -f
+
     - name: Pull Docker Images and Package
       run: |
         images="${{ github.event.inputs.docker_images }}"
-        # 修正点：将 &lt;&lt;&lt; 改为 &lt;&lt;&lt;
+        # 【修复】将 &lt;&lt;&lt; 修改为 &lt;&lt;&lt;，这是 Bash 的 Here-string 语法
         IFS=',' read -r -a image_array &lt;&lt;&lt; "$images"
         
+        # 定义最大文件大小 (900MB)，单位字节
         MAX_SIZE=943718400 
 
         for image in "${image_array[@]}"; do
           echo "Processing image: ${image}"
           docker pull "${image}" --platform "linux/amd64"
           
+          # 生成文件名，替换 / 和 : 为 _
           image_name="${image//\//_}"
           image_name="${image_name//:/_}"
           tar_file="${image_name}-amd64.tar"
           xz_file="${tar_file}.xz"
           
+          # 1. 保存镜像
           docker save "${image}" -o "${tar_file}"
           
-          # xz 默认会在成功后删除源文件 (.tar)
+          # 2. 压缩镜像
+          # -v: 显示进度, -T0: 使用所有可用线程, -8: 压缩级别
+          # 注意：xz 成功执行后会自动删除源文件 (.tar)
           xz -v -T0 -8 "${tar_file}"
           
+          # 3. 检查文件大小并决定是否分割
           if [ -f "${xz_file}" ]; then
             file_size=$(stat -c%s "${xz_file}")
             echo "File size of ${xz_file} is ${file_size} bytes."
             
             if [ "$file_size" -gt "$MAX_SIZE" ]; then
               echo "File exceeds 900MB. Splitting..."
-              # 分割文件
+              # 使用 split 分割文件，每份 900m
+              # 默认使用字母后缀 (.partaa, .partab, ...)
               split -b 900m --verbose "${xz_file}" "${xz_file}.part"
               
+              # 删除原始大文件，只保留分割后的部分
               rm "${xz_file}"
               
               echo "Split completed. Files created:"
@@ -41,6 +78,16 @@
             exit 1
           fi
           
-          # xz 已经删除了 tar 文件，这里可以省略，或者保留做异常处理
-          # if [ -f "${tar_file}" ]; then rm "${tar_file}"; fi
+          # 【优化】xz 默认已删除 .tar 文件，此处无需再次检查删除，除非 xz 失败（上面已处理）
         done
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ github.event.inputs.artifact_name }}
+        # 匹配未分割的 .xz 文件 或 分割后的 .part* 文件
+        path: |
+          ${{ github.workspace }}/*.xz
+          ${{ github.workspace }}/*.part*
+        archive: false
+        retention-days: 1
