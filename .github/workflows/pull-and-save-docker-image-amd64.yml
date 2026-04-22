@@ -30,7 +30,7 @@ jobs:
     - name: Pull Docker Images, Split and Compress
       run: |
         images="${{ github.event.inputs.docker_images }}"
-        IFS=',' read -r -a image_array &lt;&lt;&lt; "$images"
+        IFS=',' read -r -a image_array <<< "$images"
         
         # 定义最大分割大小 (900MB)
         MAX_SIZE=943718400 
