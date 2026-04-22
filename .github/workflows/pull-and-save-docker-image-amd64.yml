@@ -1,22 +1,24 @@
 name: x86-64 Pull and Save Docker Image
-
 on:
   workflow_dispatch:
     inputs:
       docker_images:
-        description: '请填写 docker 镜像名称 多个用英文逗号分开'
+        description: '请填写docker镜像名称 多个用英文逗号分开'
         required: true
-        default: 'alpine:latest,busybox:stable-glibc'
+        default: 'alpine:latest,busybox:stable-glibc'  # 设置默认的 Docker 镜像列表
       artifact_name:
         description: '请填写制品包名称'
         required: true
-        default: 'artifact'
+        default: 'artifact'  # 设置制品包名称
+      
+      
 
 jobs:
   pull_and_package:
     runs-on: ubuntu-22.04
     outputs:
-      public_artifacts: true
+      # 显式声明工件为公开
+      public_artifacts: true  # 整个 Job 的输出工件设为公开
 
     steps:
     - name: Checkout repository
@@ -27,66 +29,24 @@ jobs:
           docker system prune -a -f
           docker volume prune -f
 
-    - name: Pull Docker Images, Split and Compress
+    - name: Pull Docker Images and Package
       run: |
         images="${{ github.event.inputs.docker_images }}"
-        IFS=',' read -r -a image_array <<< "$images"
-        
-        # 定义最大分割大小 (900MB)
-        MAX_SIZE=943718400 
-
-        for image in "${image_array[@]}"; do
-          echo "Processing image: ${image}"
-          docker pull "${image}" --platform "linux/amd64"
-          
-          # 生成基础文件名
-          image_name="${image//\//_}"
-          image_name="${image_name//:/_}"
-          base_tar_name="${image_name}-amd64.tar"
-          
-          # 1. 保存镜像为 tar 包
-          docker save "${image}" -o "${base_tar_name}"
-          
-          # 获取文件大小
-          file_size=$(stat -c%s "${base_tar_name}")
-          echo "Original tar size: ${file_size} bytes"
-          
-          # 2. 判断是否需要分割
-          if [ "$file_size" -gt "$MAX_SIZE" ]; then
-            echo "File exceeds 900MB. Splitting tar file first..."
-            
-            # 使用 split 分割 tar 文件，每份 900m
-            # 生成文件名为: ${base_tar_name}.aa, ${base_tar_name}.ab, ...
-            # 注意：这里先不加后缀，split 默认追加 aa, ab
-            split -b 900m --verbose "${base_tar_name}" "${base_tar_name}."
-            
-            # 删除原始大 tar 文件
-            rm "${base_tar_name}"
-            
-            # 3. 遍历所有分割后的 tar 分片，分别进行 xz 压缩
-            for part in "${base_tar_name}".*; do
-              if [ -f "$part" ]; then
-                echo "Compressing part: $part"
-                xz -v -T0 -8 "$part"
-                # xz 命令默认会将原文件替换为 .xz 文件 (例如 file.tar.aa -&gt; file.tar.aa.xz)
-              fi
-            done
-          else
-            echo "File is within 900MB. Compressing directly..."
-            # 如果不需要分割，直接压缩
-            xz -v -T0 -8 "${base_tar_name}"
-            # 结果: ${base_tar_name}.xz
-          fi
-          
-          echo "Final files for ${image}:"
-          ls -lh ${base_tar_name}*
-        done
+          IFS=',' read -r -a image_array <<< "$images"
+          for image in "${image_array[@]}"; do
+            docker pull "${image}" --platform "linux/amd64"
+            image_name="${image//\//_}"
+            image_name="${image_name//:/_}"
+            docker save "${image}" -o "${image_name}-amd64.tar"
+            xz -v -T0 -8 "${image_name}-amd64.tar"
+            #curl -T ${image_name}-amd64.tar.xz xxxxxxxx.oss-cn-shanghai.aliyuncs.com/docker-images/
+            #rm "${image_name}-amd64.tar"
+          done
 
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
         name: ${{ github.event.inputs.artifact_name }}
-        # 匹配所有以 .xz 结尾的文件（无论是直接压缩的还是分片压缩的）
-        path: ${{ github.workspace }}/*.xz
+        path: ${{ github.workspace }}/*.tar.xz
         archive: false
-        retention-days: 1
+        retention-days: 1  # 将保留天数设置为 1 天 最多可设置90天
