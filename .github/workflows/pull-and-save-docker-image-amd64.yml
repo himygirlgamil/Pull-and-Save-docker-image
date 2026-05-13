@@ -5,20 +5,17 @@ on:
       docker_images:
         description: '请填写docker镜像名称 多个用英文逗号分开'
         required: true
-        default: 'alpine:latest,busybox:stable-glibc'  # 设置默认的 Docker 镜像列表
+        default: 'alpine:latest,busybox:stable-glibc'
       artifact_name:
         description: '请填写制品包名称'
         required: true
-        default: 'artifact'  # 设置制品包名称
-      
-      
+        default: 'artifact'
 
 jobs:
   pull_and_package:
     runs-on: ubuntu-22.04
     outputs:
-      # 显式声明工件为公开
-      public_artifacts: true  # 整个 Job 的输出工件设为公开
+      public_artifacts: true
 
     steps:
     - name: Checkout repository
@@ -26,27 +23,56 @@ jobs:
 
     - name: Clean up Docker to free space
       run: |
-          docker system prune -a -f
-          docker volume prune -f
+        docker system prune -a -f
+        docker volume prune -f
 
-    - name: Pull Docker Images and Package
+    - name: Pull Docker Images, Package and Split Big Files
       run: |
         images="${{ github.event.inputs.docker_images }}"
-          IFS=',' read -r -a image_array <<< "$images"
-          for image in "${image_array[@]}"; do
-            docker pull "${image}" --platform "linux/amd64"
-            image_name="${image//\//_}"
-            image_name="${image_name//:/_}"
-            docker save "${image}" -o "${image_name}-amd64.tar"
-            xz -v -T0 -8 "${image_name}-amd64.tar"
-            #curl -T ${image_name}-amd64.tar.xz xxxxxxxx.oss-cn-shanghai.aliyuncs.com/docker-images/
-            #rm "${image_name}-amd64.tar"
-          done
+        IFS=',' read -r -a image_array <<< "$images"
+        
+        # 创建一个专门存放最终导出文件的目录，避免污染工作区根目录
+        mkdir -p ./artifacts_export
+        
+        for image in "${image_array[@]}"; do
+          echo "Processing image: ${image}"
+          docker pull "${image}" --platform "linux/amd64"
+          
+          # 转换名称格式
+          image_name="${image//\//_}"
+          image_name="${image_name//:/_}"
+          target_tar="${image_name}-amd64.tar"
+          target_xz="${target_tar}.xz"
+          
+          # 导出并极限压缩
+          docker save "${image}" -o "${target_tar}"
+          xz -v -T0 -8 "${target_tar}"
+          
+          # 获取压缩后文件的大小（字节）
+          file_size=$(stat -c%s "${target_xz}")
+          # 1GB = 1073741824 字节
+          max_size=1073741824
+          
+          if [ "$file_size" -gt "$max_size" ]; then
+            echo "File ${target_xz} is larger than 1GB. Splitting..."
+            # 将大文件分割为每块 900M 的分片，后缀形如 .part_aa, .part_ab
+            split -b 900M -d --additional-suffix=".part" "${target_xz}" "./artifacts_export/${target_xz}_"
+            rm "${target_xz}"  # 删除原超大文件，避免重复上传
+          else
+            echo "File ${target_xz} is within limits. Moving to export dir."
+            mv "${target_xz}" ./artifacts_export/
+          fi
+          
+          # 清理本地 Docker 镜像释放空间，防止多镜像并发导致磁盘爆满
+          docker rmi "${image}" -f
+        done
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v7
+    # 统一上传所有构建出的制品
+    # 如果文件没超 1G，上传的就是形如：xxx.tar.xz
+    # 如果文件超过 1G，上传的就是形如：xxx.tar.xz_00.part, xxx.tar.xz_01.part
+    - name: Upload artifact pieces
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ github.event.inputs.artifact_name }}
-        path: ${{ github.workspace }}/*.tar.xz
-        archive: false
-        retention-days: 1  # 将保留天数设置为 1 天 最多可设置90天
+        path: ./artifacts_export/*
+        retention-days: 1
