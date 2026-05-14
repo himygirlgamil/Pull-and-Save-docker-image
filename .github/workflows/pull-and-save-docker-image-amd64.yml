@@ -12,8 +12,13 @@ on:
         default: 'artifact'
 
 jobs:
+  # ==========================================
+  # 阶段一：下载、打包、分片，并生成动态文件列表
+  # ==========================================
   pull_and_package:
     runs-on: ubuntu-22.04
+    outputs:
+      files_json: ${{ steps.set-matrix.outputs.files_json }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -24,12 +29,11 @@ jobs:
         docker volume prune -f
 
     - name: Pull Docker Images, Package and Split Big Files
-      id: process_files
       run: |
         images="${{ github.event.inputs.docker_images }}"
         IFS=',' read -r -a image_array <<< "$images"
         
-        # 创建一个空目录，用于存放最终产生的、需要被独立上传的文件
+        # 创建用于存放最终物理文件的临时目录
         mkdir -p ./final_artifacts
         
         for image in "${image_array[@]}"; do
@@ -42,21 +46,21 @@ jobs:
           temp_tar="${image_name}-amd64.tar"
           target_xz="${image_name}-amd64.xz"
           
-          # 打包并压缩为单个 xz 文件
+          # 物理打包与极限压缩
           docker save "${image}" -o "${temp_tar}"
           xz -v -T0 -8 "${temp_tar}"
           mv "${temp_tar}.xz" "${target_xz}"
           
           file_size=$(stat -c%s "${target_xz}")
-          max_size=1073741824 # 1GB
+          max_size=1073741824 # 判断线：1GB
           
           if [ "$file_size" -gt "$max_size" ]; then
             echo "File ${target_xz} is larger than 1GB. Splitting..."
-            # 进行分割，生成带后缀的文件名：例如 alpine-amd64_00, alpine-amd64_01
+            # 进行物理分片，前缀保留镜像名
             split -b 900M -d "${target_xz}" "./final_artifacts/${image_name}-amd64_"
             rm "${target_xz}"
             
-            # 为每一片加上独立的 .xz 后缀
+            # 将每个分片强制改名为标准的 .xz 结尾，绝不留任何 .part
             for part in ./final_artifacts/${image_name}-amd64_*; do
               mv "$part" "${part}.xz"
             done
@@ -67,32 +71,56 @@ jobs:
           docker rmi "${image}" -f
         done
 
-    # 关键步骤：使用 v7 版本和 archive: false 循环独立上传
-    # 这样可以免去 Matrix 繁琐的接力，直接在当前 Job 中依靠 Shell 依次把每个文件单独上报
-    - name: Upload Single Pieces via V7 without Zipping
+    # 扫描生成的物理文件，构建成不含 ZIP 包装的跨 Job 上传矩阵
+    - name: Generate Matrix List and Stage Files
+      id: set-matrix
       run: |
         cd ./final_artifacts
-        for file in *; do
-          if [ -f "$file" ]; then
-            echo "Uploading file directly as non-zip artifact: $file"
-            
-            # 获取当前单个文件的无后缀名称作为 Artifact 展示名
-            artifact_title="${{ github.event.inputs.artifact_name }}_${file}"
-            
-            # 通过 GitHub Runner 内部的机制或直接调用原生脚本（v7 规范写法）
-            # 注意：v7 规范下当 archive 为 false 时，下载得到的直接就是原物理文件本身
-            echo "::notice::Uploading $file via unzipped protocol"
-          fi
-        done
+        # 生成 JSON 数组：["file1.xz", "file2.xz", ...]
+        FILES_JSON=$(ls | jq -R -s -c 'split("\n") | del(.[] | select(. == ""))')
+        echo "files_json=${FILES_JSON}" >> $GITHUB_OUTPUT
+        echo "Generated list: ${FILES_JSON}"
+        
+        # 为了不通过 Actions 缓存（缓存会强制压成 ZIP）跨作业传递文件，
+        # 我们巧妙地利用临时大文件共享目录转存物理文件
+        cd ..
+        mkdir -p /tmp/shared_artifacts
+        mv ./final_artifacts/* /tmp/shared_artifacts/
 
-    # 替代上面 Shell 动态上报的高兼容性方案：
-    # 如果希望完全避开多 Job 带来的 zip 机制，且 100% 绕过 zip 下载拦截，
-    # 使用 v7 的原生 Action 上传单文件：
-    - name: Upload via GitHub Actions V7 (No ZIP)
+    # 利用标准的 Actions 打包上传，此时它只负责在 Job 间无损流式对接
+    - name: Inter-Job Internal Transfer
       uses: actions/upload-artifact@v7
       with:
-        # 在 v7 中，指定 path 为具体单文件且 archive: false 时，
-        # GitHub 在页面上将不提供传统的 zip 打包，而是允许用户直接下载单文件
-        path: ./final_artifacts/
-        archive: false 
+        name: internal_raw_transfer_bridge
+        path: /tmp/shared_artifacts/
+        retention-days: 1
+
+  # ==========================================
+  # 阶段二：并发矩阵，【每次严格仅上传 1 个物理文件】，彻底消灭 .zip
+  # ==========================================
+  upload_unzipped_pieces:
+    needs: pull_and_package
+    runs-on: ubuntu-22.04
+    strategy:
+      # 动态阵列：有几个 .xz 文件，GitHub 就会自动并发启动几个独立的上传通道
+      matrix:
+        filename: ${{ fromJson(needs.pull_and_package.outputs.files_json) }}
+    steps:
+    # 从内部桥梁下载阶段一产出的所有原始文件
+    - name: Download Raw Pieces
+      uses: actions/download-artifact@v7
+      with:
+        name: internal_raw_transfer_bridge
+        path: ./incoming_stage
+
+    # 核心点：调用 v7 且声明 archive: false。
+    # 此时由于 path 里面【只包含单文件】，完美满足 v7 的不打包限制！
+    - name: Upload Single Native XZ File (No ZIP Allowed)
+      uses: actions/upload-artifact@v7
+      with:
+        # 制品展示名称（去除多余点号避免干扰，转为下划线）
+        name: ${{ github.event.inputs.artifact_name }}_${{ replace(matrix.filename, '.', '_') }}
+        # 严格指定单个物理文件的绝对路径
+        path: ./incoming_stage/${{ matrix.filename }}
+        archive: false
         retention-days: 1
