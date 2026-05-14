@@ -12,11 +12,14 @@ on:
         default: 'artifact'
 
 jobs:
+  # ==========================================
+  # 阶段一：下载、打包、切片，并生成切片文件列表
+  # ==========================================
   pull_and_package:
     runs-on: ubuntu-22.04
     outputs:
-      public_artifacts: true
-
+      # 将生成的切片文件名列表，转换为 JSON 传递给下一个 Job
+      files_json: ${{ steps:set-matrix.outputs.files_json }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -31,48 +34,81 @@ jobs:
         images="${{ github.event.inputs.docker_images }}"
         IFS=',' read -r -a image_array <<< "$images"
         
-        # 创建一个专门存放最终导出文件的目录，避免污染工作区根目录
-        mkdir -p ./artifacts_export
+        # 创建统一暂存区
+        mkdir -p ./stage_dir
         
         for image in "${image_array[@]}"; do
           echo "Processing image: ${image}"
           docker pull "${image}" --platform "linux/amd64"
           
-          # 转换名称格式
           image_name="${image//\//_}"
           image_name="${image_name//:/_}"
           target_tar="${image_name}-amd64.tar"
           target_xz="${target_tar}.xz"
           
-          # 导出并极限压缩
           docker save "${image}" -o "${target_tar}"
           xz -v -T0 -8 "${target_tar}"
           
-          # 获取压缩后文件的大小（字节）
           file_size=$(stat -c%s "${target_xz}")
-          # 1GB = 1073741824 字节
-          max_size=1073741824
+          max_size=1073741824 # 1GB
           
           if [ "$file_size" -gt "$max_size" ]; then
             echo "File ${target_xz} is larger than 1GB. Splitting..."
-            # 将大文件分割为每块 900M 的分片，后缀形如 .part_aa, .part_ab
-            split -b 900M -d --additional-suffix=".part" "${target_xz}" "./artifacts_export/${target_xz}_"
-            rm "${target_xz}"  # 删除原超大文件，避免重复上传
+            # 同样切分为 900M 的切片
+            split -b 900M -d --additional-suffix=".part" "${target_xz}" "./stage_dir/${target_xz}_"
+            rm "${target_xz}"
           else
-            echo "File ${target_xz} is within limits. Moving to export dir."
-            mv "${target_xz}" ./artifacts_export/
+            echo "File ${target_xz} is within limits. Moving to stage dir."
+            mv "${target_xz}" ./stage_dir/
           fi
-          
-          # 清理本地 Docker 镜像释放空间，防止多镜像并发导致磁盘爆满
           docker rmi "${image}" -f
         done
 
-    # 统一上传所有构建出的制品
-    # 如果文件没超 1G，上传的就是形如：xxx.tar.xz
-    # 如果文件超过 1G，上传的就是形如：xxx.tar.xz_00.part, xxx.tar.xz_01.part
-    - name: Upload artifact pieces
+    # 关键步骤：扫描暂存区，生成 JSON 矩阵并输出，同时利用本地缓存传递文件
+    - name: Generate Matrix and Cache Files
+      id: set-matrix
+      run: |
+        cd ./stage_dir
+        # 获取所有生成的文件名，并转换为 JSON 数组格式，例如 ["file1","file2"]
+        FILES_JSON=$(ls | jq -R -s -c 'split("\n") | del(.[] | select(. == ""))')
+        echo "files_json=${FILES_JSON}" >> $GITHUB_OUTPUT
+        echo "Generated matrix: ${FILES_JSON}"
+        
+        # 将文件移动到工作流工作区根目录，以便通过 actions/cache 或后续接力
+        cd ..
+        mv ./stage_dir/* ./
+
+    # 临时将本地切片文件存入 Cache，以便多 Job 矩阵可以读取
+    - name: Cache pieces for upload
+      uses: actions/cache/save@v4
+      with:
+        path: ./*-amd64.tar.xz*
+        key: docker-pieces-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # ==========================================
+  # 阶段二：使用 Matrix 矩阵，每个文件独立上传
+  # ==========================================
+  upload_individual_artifacts:
+    needs: pull_and_package
+    runs-on: ubuntu-22.04
+    strategy:
+      # 动态矩阵：有几个切片文件，就会自动启动几个并发的独立虚拟步骤
+      matrix:
+        filename: ${{ fromJson(needs:pull_and_package.outputs.files_json) }}
+    steps:
+    # 恢复上一个 Job 存入的切片文件
+    - name: Restore cached pieces
+      uses: actions/cache/restore@v4
+      with:
+        path: ./*-amd64.tar.xz*
+        key: docker-pieces-${{ github.run_id }}-${{ github.run_attempt }}
+        fail-on-cache-miss: true
+
+    # 单独上传当前矩阵对应的这一个文件，将其作为一个独立的 Artifact
+    - name: Upload Single Piece as Distinct Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ github.event.inputs.artifact_name }}
-        path: ./artifacts_export/*
+        # 独立的 Artifact 名字：用户填的名字 + 下划线 + 文件名本身
+        name: ${{ github.event.inputs.artifact_name }}_${{ matrix.filename }}
+        path: ${{ matrix.filename }}
         retention-days: 1
