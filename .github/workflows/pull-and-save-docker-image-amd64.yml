@@ -64,7 +64,7 @@ jobs:
             
             # 将切片（如 xxx-amd64_00）重命名为以 .part.xz 结尾
             for part in ./stage_dir/${image_name}-amd64_*; do
-              mv "$part" "${part}.part.xz"
+              mv "$part" "${part}.xz"
             done
           else
             echo "File ${target_xz} is within limits. Moving to stage dir."
