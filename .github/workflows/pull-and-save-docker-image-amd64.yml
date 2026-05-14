@@ -60,7 +60,7 @@ jobs:
             # 关键修改：遍历刚刚生成的切片文件（如 xxx.xz_00），将其重命名为以 .part.xz 结尾
             # 这样既保留了数字顺序，又满足了 .xz 结尾的要求
             for part in ./stage_dir/${target_xz}_*; do
-              mv "$part" "${part}.part.xz"
+              mv "$part" "${part}.xz"
             done
           else
             echo "File ${target_xz} is within limits. Moving to stage dir."
