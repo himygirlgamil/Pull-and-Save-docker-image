@@ -13,7 +13,7 @@ on:
 
 jobs:
   # ==========================================
-  # 阶段一：下载、打包、分片，并生成动态文件列表
+  # 阶段一：下载、打包、分片，并生成规范的无点文件名列表
   # ==========================================
   pull_and_package:
     runs-on: ubuntu-22.04
@@ -33,7 +33,7 @@ jobs:
         images="${{ github.event.inputs.docker_images }}"
         IFS=',' read -r -a image_array <<< "$images"
         
-        # 创建用于存放最终物理文件的临时目录
+        # 创建临时目录
         mkdir -p ./final_artifacts
         
         for image in "${image_array[@]}"; do
@@ -52,21 +52,24 @@ jobs:
           mv "${temp_tar}.xz" "${target_xz}"
           
           file_size=$(stat -c%s "${target_xz}")
-          max_size=1073741824 # 判断线：1GB
+          max_size=1073741824 # 1GB
           
           if [ "$file_size" -gt "$max_size" ]; then
             echo "File ${target_xz} is larger than 1GB. Splitting..."
-            # 进行物理分片，前缀保留镜像名
+            # 进行物理分片
             split -b 900M -d "${target_xz}" "./final_artifacts/${image_name}-amd64_"
             rm "${target_xz}"
             
-            # 将每个分片强制改名为标准的 .xz 结尾，绝不留任何 .part
+            # 【核心修复点】：直接在物理重命名时，将文件名里的点号直接变更为下划线
+            # 例如本来的物理文件名为：image-amd64_00
+            # 经过处理后，最终物理文件名本身就是：image-amd64_00_xz
             for part in ./final_artifacts/${image_name}-amd64_*; do
-              mv "$part" "${part}.xz"
+              mv "$part" "${part}_xz"
             done
           else
             echo "File ${target_xz} is within limits. Moving to final dir."
-            mv "${target_xz}" ./final_artifacts/
+            # 小镜像原本是 xxx-amd64.xz，直接改名为 xxx-amd64_xz，消灭物理文件名中的点号
+            mv "${target_xz}" "./final_artifacts/${image_name}-amd64_xz"
           fi
           docker rmi "${image}" -f
         done
@@ -76,18 +79,16 @@ jobs:
       id: set-matrix
       run: |
         cd ./final_artifacts
-        # 生成 JSON 数组：["file1.xz", "file2.xz", ...]
+        # 生成的 JSON 数组内不再包含任何点号（例如：["alpine-amd64_xz", "ubuntu-amd64_00_xz"]）
         FILES_JSON=$(ls | jq -R -s -c 'split("\n") | del(.[] | select(. == ""))')
         echo "files_json=${FILES_JSON}" >> $GITHUB_OUTPUT
         echo "Generated list: ${FILES_JSON}"
         
-        # 为了不通过 Actions 缓存（缓存会强制压成 ZIP）跨作业传递文件，
-        # 我们巧妙地利用临时大文件共享目录转存物理文件
         cd ..
         mkdir -p /tmp/shared_artifacts
         mv ./final_artifacts/* /tmp/shared_artifacts/
 
-    # 利用标准的 Actions 打包上传，此时它只负责在 Job 间无损流式对接
+    # 无损跨作业流式转存对接
     - name: Inter-Job Internal Transfer
       uses: actions/upload-artifact@v7
       with:
@@ -96,31 +97,28 @@ jobs:
         retention-days: 1
 
   # ==========================================
-  # 阶段二：并发矩阵，【每次严格仅上传 1 个物理文件】，彻底消灭 .zip
+  # 阶段二：并发矩阵，【每次严格仅上传 1 个无点物理文件】，彻底消灭 .zip 拦截
   # ==========================================
   upload_unzipped_pieces:
     needs: pull_and_package
     runs-on: ubuntu-22.04
     strategy:
-      # 动态阵列：有几个 .xz 文件，GitHub 就会自动并发启动几个独立的上传通道
       matrix:
         filename: ${{ fromJson(needs.pull_and_package.outputs.files_json) }}
     steps:
-    # 从内部桥梁下载阶段一产出的所有原始文件
+    # 从内部桥梁下载阶段一产出的所有原始无点文件
     - name: Download Raw Pieces
       uses: actions/download-artifact@v7
       with:
         name: internal_raw_transfer_bridge
         path: ./incoming_stage
 
-    # 核心点：调用 v7 且声明 archive: false。
-    # 此时由于 path 里面【只包含单文件】，完美满足 v7 的不打包限制！
+    # 调用 v7 且声明 archive: false。
+    # 此时：name 里不包含任何点号，path 里指向的单个物理文件名也由于上面修改而不含点号
     - name: Upload Single Native XZ File (No ZIP Allowed)
       uses: actions/upload-artifact@v7
       with:
-        # 制品展示名称（去除多余点号避免干扰，转为下划线）
-        name: ${{ github.event.inputs.artifact_name }}_${{ replace(matrix.filename, '.', '_') }}
-        # 严格指定单个物理文件的绝对路径
+        name: ${{ github.event.inputs.artifact_name }}_${{ matrix.filename }}
         path: ./incoming_stage/${{ matrix.filename }}
         archive: false
         retention-days: 1
