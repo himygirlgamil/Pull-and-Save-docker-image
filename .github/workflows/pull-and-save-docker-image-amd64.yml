@@ -18,8 +18,8 @@ jobs:
   pull_and_package:
     runs-on: ubuntu-22.04
     outputs:
-      # 将生成的切片文件名列表，转换为 JSON 传递给下一个 Job
-      files_json: ${{ steps:set-matrix.outputs.files_json }}
+      # 修复点 1：将 steps:set-matrix 修改为 steps.set-matrix
+      files_json: ${{ steps.set-matrix.outputs.files_json }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -54,7 +54,6 @@ jobs:
           
           if [ "$file_size" -gt "$max_size" ]; then
             echo "File ${target_xz} is larger than 1GB. Splitting..."
-            # 同样切分为 900M 的切片
             split -b 900M -d --additional-suffix=".part" "${target_xz}" "./stage_dir/${target_xz}_"
             rm "${target_xz}"
           else
@@ -64,21 +63,20 @@ jobs:
           docker rmi "${image}" -f
         done
 
-    # 关键步骤：扫描暂存区，生成 JSON 矩阵并输出，同时利用本地缓存传递文件
+    # 扫描暂存区，生成 JSON 矩阵并输出
     - name: Generate Matrix and Cache Files
       id: set-matrix
       run: |
         cd ./stage_dir
-        # 获取所有生成的文件名，并转换为 JSON 数组格式，例如 ["file1","file2"]
+        # 获取所有生成的文件名，并转换为 JSON 数组格式
         FILES_JSON=$(ls | jq -R -s -c 'split("\n") | del(.[] | select(. == ""))')
         echo "files_json=${FILES_JSON}" >> $GITHUB_OUTPUT
         echo "Generated matrix: ${FILES_JSON}"
         
-        # 将文件移动到工作流工作区根目录，以便通过 actions/cache 或后续接力
         cd ..
         mv ./stage_dir/* ./
 
-    # 临时将本地切片文件存入 Cache，以便多 Job 矩阵可以读取
+    # 临时将本地切片文件存入 Cache
     - name: Cache pieces for upload
       uses: actions/cache/save@v4
       with:
@@ -92,9 +90,9 @@ jobs:
     needs: pull_and_package
     runs-on: ubuntu-22.04
     strategy:
-      # 动态矩阵：有几个切片文件，就会自动启动几个并发的独立虚拟步骤
+      # 修复点 2：将 needs:pull_and_package 修改为 needs.pull_and_package
       matrix:
-        filename: ${{ fromJson(needs:pull_and_package.outputs.files_json) }}
+        filename: ${{ fromJson(needs.pull_and_package.outputs.files_json) }}
     steps:
     # 恢复上一个 Job 存入的切片文件
     - name: Restore cached pieces
@@ -104,11 +102,10 @@ jobs:
         key: docker-pieces-${{ github.run_id }}-${{ github.run_attempt }}
         fail-on-cache-miss: true
 
-    # 单独上传当前矩阵对应的这一个文件，将其作为一个独立的 Artifact
+    # 单独上传当前矩阵对应的这一个文件
     - name: Upload Single Piece as Distinct Artifact
       uses: actions/upload-artifact@v4
       with:
-        # 独立的 Artifact 名字：用户填的名字 + 下划线 + 文件名本身
         name: ${{ github.event.inputs.artifact_name }}_${{ matrix.filename }}
         path: ${{ matrix.filename }}
         retention-days: 1
