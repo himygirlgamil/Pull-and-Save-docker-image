@@ -52,7 +52,8 @@ jobs:
           mv "${temp_tar}.xz" "${target_xz}"
           
           file_size=$(stat -c%s "${target_xz}")
-          max_size=1073741824 # 1GB
+          #max_size=1073741824 # 1GB
+          max_size=1000000000 # 1GB
           
           if [ "$file_size" -gt "$max_size" ]; then
             echo "File ${target_xz} is larger than 1GB. Splitting..."
